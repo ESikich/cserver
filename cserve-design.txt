@@ -1,0 +1,533 @@
+cserve — Design Document
+HTTP/1.1 Server in C (Linux)
+Rev 4 — DRAFT
+========================================================================
+
+
+1. GOALS & NON-GOALS
+------------------------------------------------------------------------
+
+cserve is a single-process, event-driven HTTP/1.1 server targeting
+Linux. It aims to serve static files and support a minimal plugin-style
+handler API for dynamic content -- a teaching tool, an embedded server
+for a CLI tool, or a foundation for experimentation. It is not trying
+to be nginx.
+
+Goals:
+  - Correctness over performance
+  - Handle HTTP/1.1 keep-alive
+  - Serve static files efficiently via sendfile()
+  - Expose a clean handler registration API
+  - No external dependencies -- only libc and POSIX sockets
+
+Non-Goals:
+  - TLS/HTTPS (use a reverse proxy)
+  - HTTP/2
+  - Windows or macOS portability
+  - A scripting layer
+  - Production hardening against all possible malice
+
+
+2. ARCHITECTURE
+------------------------------------------------------------------------
+
+Layers, top to bottom:
+
+  TRANSPORT        socket, bind, listen, accept4
+  EVENT LOOP       epoll (edge-triggered, EPOLLET)
+  CONNECTION MGR   conn_table, state machine, timeout wheel
+  HTTP PARSER      request line, header parser, body framing
+  ROUTER           static handler, dynamic handlers, 404/405
+  RESPONSE WRITER  header builder, sendfile, writev scatter
+  UTILITIES        arena allocator, string pool, logger, config
+
+Each layer communicates through explicit structs. No global mutable
+state except the epoll fd and the connection table. The event loop
+sits at the bottom of the call stack and never blocks.
+
+
+3. CONCURRENCY MODEL
+------------------------------------------------------------------------
+
+We use a single-threaded epoll-based event loop. All sockets are
+opened with O_NONBLOCK (via accept4 SOCK_NONBLOCK). The server never
+calls read() or write() from a blocking context.
+
+epoll is used in edge-triggered mode (EPOLLET). This means the server
+must drain each fd fully on every wakeup -- read/write in a loop until
+EAGAIN -- rather than relying on epoll to re-notify. Edge-triggered
+is chosen because it scales better and makes partial-read bugs
+immediately obvious rather than silently masking them.
+
+Why epoll and not io_uring:
+
+  io_uring is the modern Linux answer for high-performance async I/O.
+  It uses a submission/completion ring model and avoids syscalls in the
+  hot path. It is more scalable but requires a substantially different
+  architecture and a reasonably recent kernel (5.1+).
+
+  epoll is universal, well-understood, and sufficient for our goals.
+  io_uring is noted as a v2 upgrade path.
+
+Dynamic handler callbacks must be non-blocking. Any handler that needs
+slow work (DB, subprocess) is expected to schedule that work itself and
+return immediately. No async runtime is provided in v1.
+
+Linux-specific setup:
+
+  SIGPIPE must be ignored (signal(SIGPIPE, SIG_IGN)) before any socket
+  operations. SIGTERM and SIGINT are caught for graceful shutdown via
+  a self-pipe or signalfd -- not from within a signal handler directly.
+
+
+4. CONNECTION LIFECYCLE
+------------------------------------------------------------------------
+
+Each connection is a state machine with the following states:
+
+  READING_REQUEST
+    Read bytes into the conn's input buffer until EAGAIN. Feed bytes
+    to the HTTP parser incrementally. A single read() call may contain
+    a partial request or multiple pipelined requests. Parser signals
+    DONE or NEED_MORE.
+    -> DISPATCHING on complete request
+
+  DISPATCHING
+    Look up the route table. Call the matched handler synchronously.
+    Handler writes response headers and body into the conn's output
+    buffer. For file responses, it stores the fd + offset instead of
+    copying bytes.
+    -> WRITING_RESPONSE
+
+  WRITING_RESPONSE
+    Drain the output buffer with writev() (scatter-gather) or
+    sendfile() for file responses. If EAGAIN, re-arm EPOLLOUT and
+    yield -- resume on next epoll wakeup. On complete drain, check
+    Connection: keep-alive.
+    -> READING_REQUEST (keep-alive) or CLOSING
+
+  CLOSING
+    shutdown(SHUT_RDWR), close(fd), remove from epoll, return conn
+    struct to pool. A coarse-grained timeout wheel evicts idle
+    keep-alive connections after a configurable deadline (default 30s).
+    -> CLOSED (pooled)
+
+
+5. HTTP PARSER
+------------------------------------------------------------------------
+
+The parser is a hand-rolled state machine operating on a byte buffer.
+It never allocates heap memory. All parsed values are represented as
+(offset, length) slices into the connection's existing input buffer --
+zero-copy header access.
+
+Parser states:
+  PS_REQ_METHOD, PS_REQ_PATH, PS_REQ_VERSION,
+  PS_HEADER_NAME, PS_HEADER_VALUE, PS_HEADER_END,
+  PS_BODY, PS_DONE, PS_ERROR
+
+Headers are stored in a fixed-size flat array of (name_slice,
+value_slice) pairs -- up to 64 headers max. Requests exceeding this
+get a 431 response. No dynamic allocation inside the parser.
+
+Hard limits enforced at parse time:
+  - Request line   <=  8 KB
+  - Single header  <=  8 KB
+  - Total headers  <= 64 KB
+  - Body           <= configurable (default 1 MB)
+
+Violations return 400 or 413 with Connection: close.
+
+Path traversal: after URL-decode, every static file path is resolved
+with realpath() and checked to confirm it falls within the configured
+document root before any file is opened.
+
+
+6. MEMORY MODEL
+------------------------------------------------------------------------
+
+Each connection owns:
+  - inbuf:  64 KB ring buffer for incoming bytes
+  - outbuf: 128 KB ring buffer for outgoing bytes
+  - arena:  8 KB scratch allocator, reset between keep-alive requests
+
+No malloc() in the hot path. No fragmentation. No free-list chasing.
+
+A pool of pre-allocated conn structs lives in a free-list. Max
+concurrent connections is a compile-time constant (default 4096). When
+the pool is exhausted the server returns 503 with Retry-After rather
+than attempting further allocation.
+
+Approximate per-connection memory footprint: ~200 KB. At 4096
+connections: ~800 MB worst case -- acceptable on any modern server.
+
+
+7. STRUCT DEFINITIONS
+------------------------------------------------------------------------
+
+The following C struct skeletons are canonical. Implementations must
+not add, remove, or rename fields without updating this document.
+
+  /* A slice into a buffer -- no ownership, no copy */
+  typedef struct {
+      size_t  off;
+      size_t  len;
+  } slice_t;
+
+  /* A parsed HTTP header (both name and value are slices) */
+  typedef struct {
+      slice_t name;
+      slice_t value;
+  } header_t;
+
+  /* A fully parsed HTTP request */
+  #define MAX_HEADERS 64
+  typedef struct {
+      slice_t   method;
+      slice_t   path;         /* URL-decoded, not yet path-resolved */
+      slice_t   version;      /* "HTTP/1.1" etc */
+      header_t  headers[MAX_HEADERS];
+      int       header_count;
+      slice_t   body;
+      int       keep_alive;   /* 1 if Connection: keep-alive */
+      uint64_t  content_length;
+  } http_request_t;
+
+  /* HTTP response built by a handler */
+  typedef struct {
+      int      status;                /* e.g. 200, 404 */
+      char     headers[4096];         /* pre-formatted header block */
+      size_t   headers_len;
+      /* For in-memory body (dynamic handlers): */
+      uint8_t *body;                  /* points into conn arena */
+      size_t   body_len;
+      /* For file body (static handler): */
+      int      file_fd;               /* -1 if none */
+      off_t    file_offset;
+      off_t    file_size;
+  } http_response_t;
+
+  /* Parser state machine */
+  typedef enum {
+      PS_REQ_METHOD, PS_REQ_PATH, PS_REQ_VERSION,
+      PS_HEADER_NAME, PS_HEADER_VALUE, PS_HEADER_END,
+      PS_BODY, PS_DONE, PS_ERROR
+  } parse_state_t;
+
+  typedef struct {
+      parse_state_t  state;
+      size_t         pos;         /* current read position in inbuf */
+      size_t         mark;        /* start of current token */
+      http_request_t req;
+  } parser_t;
+
+  /* Connection state */
+  typedef enum {
+      CONN_READING_REQUEST,
+      CONN_DISPATCHING,
+      CONN_WRITING_RESPONSE,
+      CONN_CLOSING
+  } conn_state_t;
+
+  /* A single connection -- allocated from the pool, never from heap */
+  #define INBUF_SIZE   65536
+  #define OUTBUF_SIZE  131072
+  #define ARENA_SIZE   8192
+  typedef struct conn_s {
+      int           fd;
+      conn_state_t  state;
+      uint64_t      last_active_ms;  /* for timeout wheel */
+
+      uint8_t       inbuf[INBUF_SIZE];
+      size_t        inbuf_len;
+
+      uint8_t       outbuf[OUTBUF_SIZE];
+      size_t        outbuf_head;
+      size_t        outbuf_tail;
+
+      uint8_t       arena[ARENA_SIZE];
+      size_t        arena_pos;
+
+      parser_t      parser;
+      http_response_t response;
+
+      struct conn_s *next_free;    /* free-list linkage */
+  } conn_t;
+
+  /* Route table entry */
+  typedef int (*handler_fn)(conn_t *conn, const http_request_t *req,
+                             http_response_t *resp);
+  typedef struct {
+      char        method[16];  /* "GET", "POST", "" = any */
+      char        path[256];   /* exact match; "" = catch-all */
+      handler_fn  handler;
+  } route_t;
+
+  /* Server configuration -- populated at startup, then read-only */
+  #define MAX_ROUTES 64
+  typedef struct {
+      char     host[64];           /* default "0.0.0.0" */
+      uint16_t port;               /* default 8080 */
+      char     docroot[PATH_MAX];  /* document root for static files */
+      int      max_connections;    /* default 4096 */
+      int      request_timeout_ms;    /* default 10000 */
+      int      keepalive_timeout_ms;  /* default 30000 */
+      size_t   max_body_bytes;     /* default 1 MB */
+      int      log_level;          /* 0=off 1=error 2=info 3=debug */
+      route_t  routes[MAX_ROUTES];
+      int      route_count;
+  } server_config_t;
+
+
+8. HANDLER API
+------------------------------------------------------------------------
+
+A handler is a function with this exact signature:
+
+  int handler_fn(conn_t *conn, const http_request_t *req,
+                 http_response_t *resp);
+
+The handler receives a fully parsed request and an empty response
+struct. It must:
+
+  1. Set resp->status to the desired HTTP status code.
+  2. Write response headers into resp->headers / resp->headers_len
+     using the provided helper cs_add_header().
+  3. Either set resp->body + resp->body_len (in-memory response),
+     or set resp->file_fd + resp->file_offset + resp->file_size
+     (file response via sendfile). Not both.
+  4. Return HANDLER_OK (0) on success or HANDLER_ERR (-1) on failure.
+
+On HANDLER_ERR the server sends a 500 response with Connection: close
+and does not attempt to re-use the connection.
+
+The handler must not:
+  - Block (no sleep, no synchronous file I/O beyond what's already
+    opened, no network calls)
+  - Call malloc() -- use cs_arena_alloc(conn, size) instead
+  - Close or modify the socket
+  - Retain pointers into req after returning (req data is in inbuf
+    which is reset on the next request cycle)
+
+Helper functions available to handlers:
+
+  /* Allocate from the per-request arena. Returns NULL if full. */
+  void   *cs_arena_alloc(conn_t *conn, size_t size);
+
+  /* Append a header line to resp->headers. */
+  int     cs_add_header(http_response_t *resp,
+                        const char *name, const char *value);
+
+  /* Look up a request header value. Returns NULL if not present. */
+  const char *cs_get_header(const http_request_t *req,
+                             conn_t *conn, const char *name);
+
+Registering a handler at startup:
+
+  cs_add_route(&config, "GET",  "/hello", my_hello_handler);
+  cs_add_route(&config, "POST", "/echo",  my_echo_handler);
+  cs_add_route(&config, "",     "",       my_catch_all_handler);
+
+Routes are matched in registration order. The first match wins.
+The static file handler is registered automatically for any path not
+matched by a dynamic route, provided docroot is configured.
+
+
+9. ERROR HANDLING CONVENTIONS
+------------------------------------------------------------------------
+
+All errors fall into one of three categories:
+
+  FATAL
+    Unrecoverable startup errors (port already in use, bad config).
+    The server prints to stderr and exits with code 1. No cleanup
+    beyond closing the listen fd is attempted.
+
+  CONNECTION ERROR
+    A socket error on a specific connection (read/write failure,
+    parse error, handler error). The connection is closed immediately
+    with no response if headers haven't been sent yet, or with
+    Connection: close appended if they have. The error is logged at
+    LOG_ERROR level. The server continues running.
+
+  SOFT ERROR
+    Expected conditions: 404, 405, 413, 431, 503. The server sends the
+    appropriate HTTP response with a plain-text body, sets
+    Connection: close where appropriate, and recycles the connection
+    normally.
+
+Logging levels:
+  LOG_ERROR (1)  -- connection drops, parse failures, handler errors
+  LOG_INFO  (2)  -- one line per completed request (access log style)
+  LOG_DEBUG (3)  -- state transitions, buffer drain progress
+
+Log format (one line per entry, to stdout):
+  [LEVEL] timestamp_ms method path status bytes_sent remote_addr
+
+
+10. FILE LAYOUT
+------------------------------------------------------------------------
+
+All source lives in a flat src/ directory. No subdirectories.
+
+  src/
+    main.c        Entry point. Parses argv, builds config, starts server.
+    server.c      epoll setup, listen socket, event loop, accept4.
+    conn.c        Connection pool, conn_t lifecycle, arena allocator.
+    parser.c      HTTP request parser state machine.
+    router.c      Route table, dispatch, cs_add_route().
+    static.c      Static file handler, MIME types, sendfile().
+    response.c    Response builder helpers: cs_add_header(), status lines.
+    log.c         Logger. Thread-unsafe (single-threaded server, fine).
+    config.c      Config defaults, INI file parsing, argv parsing.
+    util.c        URL decode, path safety check, string utilities.
+
+  include/
+    cserve.h      All public types and function declarations.
+                  Single header -- everything is declared here.
+
+  tests/
+    test_parser.c Unit tests for the HTTP parser.
+    test_router.c Unit tests for route matching.
+    test_util.c   Unit tests for URL decode and path checks.
+
+  CMakeLists.txt  (see section 12)
+
+
+11. LINUX API REFERENCE
+------------------------------------------------------------------------
+
+Key system calls and their roles in cserve:
+
+  epoll_create1(EPOLL_CLOEXEC)   create epoll instance
+  epoll_ctl(EPOLL_CTL_ADD/MOD)   add/modify fd in interest list
+  epoll_wait()                   block until events ready
+  accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)  accept + set flags atomically
+  read() / write()               non-blocking I/O on conn fds
+  writev()                       scatter-gather write for response
+  sendfile()                     zero-copy file-to-socket transfer
+  open() / close()               static file access
+  realpath()                     canonical path for traversal check
+  signal(SIGPIPE, SIG_IGN)       suppress broken-pipe termination
+  signalfd()                     receive SIGTERM/SIGINT in event loop
+  clock_gettime(CLOCK_MONOTONIC) millisecond timestamps for timeouts
+
+
+12. BUILD SYSTEM
+------------------------------------------------------------------------
+
+Toolchain: GCC or Clang via CMake. GCC >= 13 or Clang >= 17
+           required for C23 support.
+Standard: C23 (-std=c23).
+Target: x86-64 Linux only. _GNU_SOURCE defined project-wide
+        (required for accept4, signalfd, sendfile).
+
+CMakeLists.txt requirements:
+  - cmake_minimum_required(VERSION 3.20)
+  - add_compile_definitions(_GNU_SOURCE)
+  - Two build configs: Debug (-O0 -g3 -fsanitize=address,undefined)
+    and Release (-O2)
+  - A "tests" target that builds and runs tests/ with CTest
+
+Compiler warnings: -Wall -Wextra -Wpedantic -Werror. The following
+warnings are explicitly suppressed project-wide:
+  -Wno-unused-parameter   (acceptable in handler stubs)
+
+The build must produce a single executable: cserve.
+No shared libraries, no install target.
+
+
+13. CONFIGURATION
+------------------------------------------------------------------------
+
+Configuration is loaded in this priority order (highest wins):
+  1. Command-line arguments
+  2. INI file (if --config path is given)
+  3. Compiled-in defaults (see server_config_t in section 7)
+
+Command-line arguments:
+
+  --host     <addr>   Interface to bind (default: 0.0.0.0)
+  --port     <port>   Port to listen on (default: 8080)
+  --root     <path>   Document root for static files (default: ./www)
+  --config   <path>   Path to INI file
+  --log      <level>  Log level: off|error|info|debug (default: info)
+  --max-conn <n>      Max concurrent connections (default: 4096)
+
+INI file format (key = value, # comments):
+
+  [server]
+  host     = 0.0.0.0
+  port     = 8080
+  root     = /var/www
+  log      = info
+  max_conn = 4096
+
+  [limits]
+  request_timeout_ms   = 10000
+  keepalive_timeout_ms = 30000
+  max_body_bytes       = 1048576
+
+Unknown keys are ignored with a LOG_DEBUG warning. Malformed values
+cause a fatal error with a descriptive message.
+
+
+14. RISKS
+------------------------------------------------------------------------
+
+HIGH -- Buffer overflow in parser
+  The parser operates on raw bytes from untrusted clients.
+  Mitigation: hard length limits at every state transition, no pointer
+  arithmetic without bounds checks, fuzz testing with AFL++ before
+  any release.
+
+HIGH -- Path traversal
+  URL-decoded paths could escape the document root.
+  Mitigation: realpath() on every static request, prefix check against
+  document root before open().
+
+MEDIUM -- Slow-read DoS (Slowloris)
+  Clients that trickle headers hold connections open.
+  Mitigation: timeout wheel evicts connections that haven't completed
+  a request within a configurable window (default 10s).
+
+MEDIUM -- Connection pool exhaustion
+  4096 slow keep-alive connections could exhaust the pool.
+  Mitigation: aggressive keep-alive timeout, HTTP 503 with Retry-After
+  when pool is full, configurable pool size at startup.
+
+LOW -- SIGPIPE on closed socket writes
+  A write to a remotely closed socket sends SIGPIPE by default,
+  killing the process.
+  Mitigation: signal(SIGPIPE, SIG_IGN) at startup; use MSG_NOSIGNAL
+  on all send() calls as a belt-and-suspenders measure.
+
+LOW -- Integer overflow in Content-Length
+  Maliciously large Content-Length values could cause logic errors.
+  Mitigation: parse as uint64_t, reject values above body limit before
+  any reading begins.
+
+
+15. BUILD PLAN
+------------------------------------------------------------------------
+
+Phase 1 -- Skeleton
+  TCP echo server, epoll event loop, conn pool,
+  O_NONBLOCK sockets via accept4, SIGPIPE/SIGTERM handling
+
+Phase 2 -- HTTP
+  Request parser, 200/404 responses, static file serving,
+  sendfile(), MIME types
+
+Phase 3 -- Production
+  Keep-alive, timeout wheel, dynamic handler API,
+  path traversal guard, config file
+
+Phase 4 -- Hardening
+  AFL++ fuzzing, AddressSanitizer clean run,
+  load testing, access log, graceful shutdown
+
+
+========================================================================
+cserve-design.txt // rev 4
+========================================================================
