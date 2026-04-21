@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cserve.h"
@@ -53,6 +54,62 @@ mime_type(const char *path)
 }
 
 /* ------------------------------------------------------------------ */
+/* ETag helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compute the ETag for a file: quoted hex of (mtime << 32 | size).
+ * Size is truncated to 32 bits per design spec.
+ */
+static void
+make_etag(const struct stat *st, char *buf, size_t size)
+{
+    uint64_t v = ((uint64_t)st->st_mtime << 32)
+               | ((uint64_t)st->st_size & 0xFFFFFFFFu);
+    snprintf(buf, size, "\"%llx\"", (unsigned long long)v);
+}
+
+/* ------------------------------------------------------------------ */
+/* Conditional GET                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Returns 1 if the request If-None-Match matches the given ETag string.
+ * Handles wildcard (*) and comma-separated lists.
+ */
+static int
+inm_matches(const uint8_t *inbuf, slice_t inm, const char *etag)
+{
+    char buf[256];
+    size_t cplen = inm.len < sizeof(buf) - 1 ? inm.len : sizeof(buf) - 1;
+    memcpy(buf, inbuf + inm.off, cplen);
+    buf[cplen] = '\0';
+
+    if (strcmp(buf, "*") == 0)
+        return 1;
+    return strstr(buf, etag) != NULL;
+}
+
+/*
+ * Returns 1 if the file mtime is not newer than the If-Modified-Since
+ * header value, meaning a 304 should be sent.
+ */
+static int
+ims_not_newer(const uint8_t *inbuf, slice_t ims, time_t mtime)
+{
+    char buf[64];
+    size_t cplen = ims.len < sizeof(buf) - 1 ? ims.len : sizeof(buf) - 1;
+    memcpy(buf, inbuf + ims.off, cplen);
+    buf[cplen] = '\0';
+
+    struct tm tm = {0};
+    if (strptime(buf, "%a, %d %b %Y %H:%M:%S GMT", &tm) == NULL)
+        return 0;
+    time_t ims_time = timegm(&tm);
+    return mtime <= ims_time;
+}
+
+/* ------------------------------------------------------------------ */
 /* Handler                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -60,6 +117,19 @@ int
 cs_static_handler(conn_t *conn, const http_request_t *req,
                   http_response_t *resp)
 {
+    /* Static files support GET and HEAD only */
+    {
+        const uint8_t *m = conn->inbuf + req->method.off;
+        size_t mlen = req->method.len;
+        int ok = (mlen == 3 && memcmp(m, "GET",  3) == 0)
+              || (mlen == 4 && memcmp(m, "HEAD", 4) == 0);
+        if (!ok) {
+            resp->status = 405;
+            cs_add_header(resp, "Allow", "GET, HEAD");
+            return HANDLER_OK;
+        }
+    }
+
     /* URL-decode the path */
     char decoded[PATH_MAX];
     if (cs_url_decode((const char *)(conn->inbuf + req->path.off),
@@ -144,7 +214,35 @@ cs_static_handler(conn_t *conn, const http_request_t *req,
         return HANDLER_OK;
     }
 
-    /* Build response */
+    /* Compute caching metadata */
+    char etag[64];
+    make_etag(&st, etag, sizeof(etag));
+
+    char last_mod[64];
+    cs_http_date(st.st_mtime, last_mod, sizeof(last_mod));
+
+    /* Conditional GET: If-None-Match takes precedence */
+    if (req->if_none_match.len > 0
+        && inm_matches(conn->inbuf, req->if_none_match, etag)) {
+        close(fd);
+        resp->status = 304;
+        cs_add_header(resp, "ETag", etag);
+        cs_add_header(resp, "Last-Modified", last_mod);
+        return HANDLER_OK;
+    }
+
+    /* Conditional GET: If-Modified-Since */
+    if (req->if_modified_since.len > 0
+        && ims_not_newer(conn->inbuf, req->if_modified_since,
+                         st.st_mtime)) {
+        close(fd);
+        resp->status = 304;
+        cs_add_header(resp, "ETag", etag);
+        cs_add_header(resp, "Last-Modified", last_mod);
+        return HANDLER_OK;
+    }
+
+    /* Build 200 response */
     resp->status      = 200;
     resp->file_fd     = fd;
     resp->file_offset = 0;
@@ -155,6 +253,8 @@ cs_static_handler(conn_t *conn, const http_request_t *req,
     char clen[32];
     snprintf(clen, sizeof(clen), "%lld", (long long)st.st_size);
     cs_add_header(resp, "Content-Length", clen);
+    cs_add_header(resp, "ETag", etag);
+    cs_add_header(resp, "Last-Modified", last_mod);
 
     return HANDLER_OK;
 }

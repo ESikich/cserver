@@ -11,6 +11,7 @@
 #define PARSE_DONE    1
 #define PARSE_ERR   (-1)
 #define PARSE_ERR_431 (-431)  /* too many header fields */
+#define PARSE_ERR_501 (-501)  /* Transfer-Encoding not implemented */
 
 #define REQ_LINE_MAX   8192
 #define HEADER_MAX     8192
@@ -66,10 +67,21 @@ trim_right(const uint8_t *buf, slice_t s)
 /* Post-headers processing                                             */
 /* ------------------------------------------------------------------ */
 
+static int
+has_transfer_encoding(const uint8_t *buf, const http_request_t *req)
+{
+    for (int i = 0; i < req->header_count; i++) {
+        if (slice_eq_ci(buf, req->headers[i].name, "transfer-encoding"))
+            return 1;
+    }
+    return 0;
+}
+
 static void
 finalize_headers(parser_t *p, const uint8_t *buf)
 {
     int ka_explicit = 0;
+    int seen_cl = 0;
 
     for (int i = 0; i < p->req.header_count; i++) {
         slice_t name  = p->req.headers[i].name;
@@ -77,9 +89,16 @@ finalize_headers(parser_t *p, const uint8_t *buf)
 
         if (slice_eq_ci(buf, name, "content-length")) {
             int ok;
-            p->req.content_length = parse_uint64(buf, value, &ok);
-            if (!ok)
+            uint64_t v = parse_uint64(buf, value, &ok);
+            if (!ok) {
                 p->state = PS_ERROR;
+            } else if (seen_cl && v != p->req.content_length) {
+                /* RFC 7230 §3.3.3: differing Content-Length values */
+                p->state = PS_ERROR;
+            } else {
+                p->req.content_length = v;
+                seen_cl = 1;
+            }
 
         } else if (slice_eq_ci(buf, name, "connection")) {
             ka_explicit = 1;
@@ -87,6 +106,12 @@ finalize_headers(parser_t *p, const uint8_t *buf)
                 p->req.keep_alive = 1;
             else
                 p->req.keep_alive = 0;
+
+        } else if (slice_eq_ci(buf, name, "if-none-match")) {
+            p->req.if_none_match = value;
+
+        } else if (slice_eq_ci(buf, name, "if-modified-since")) {
+            p->req.if_modified_since = value;
         }
     }
 
@@ -187,6 +212,9 @@ cs_parser_feed(parser_t *p, const uint8_t *buf, size_t len)
                 finalize_headers(p, buf);
                 if (p->state == PS_ERROR)
                     return PARSE_ERR;
+                /* RFC 7230 §3.3.1: chunked TE is not implemented */
+                if (has_transfer_encoding(buf, &p->req))
+                    return PARSE_ERR_501;
                 if (p->req.content_length > 0) {
                     p->mark = p->pos;
                     p->state = PS_BODY;

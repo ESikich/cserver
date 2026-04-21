@@ -53,6 +53,20 @@ cs_url_decode(const char *in, size_t in_len,
 }
 
 /*
+ * Format time_t as an RFC 7231 HTTP-date into buf.
+ * Returns the number of bytes written (excluding NUL), or -1 on error.
+ */
+int
+cs_http_date(time_t t, char *buf, size_t size)
+{
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    size_t n = strftime(buf, size,
+                        "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    return (n > 0) ? (int)n : -1;
+}
+
+/*
  * Returns 1 if resolved_path is safely within docroot, 0 otherwise.
  * Caller must have already run realpath() on the path.
  */

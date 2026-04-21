@@ -21,6 +21,7 @@ cs_config_defaults(server_config_t *cfg)
         .keepalive_timeout_ms = 30000,
         .max_body_bytes       = 1048576,
         .log_level            = LOG_INFO,
+        .log_file             = "",
         .route_count          = 0,
     };
 }
@@ -73,6 +74,8 @@ apply_ini_key(server_config_t *cfg, const char *section,
                 cs_fatal("config line %d: invalid max_conn '%s'",
                          lineno, val);
             cfg->max_connections = n;
+        } else if (strcmp(key, "log_file") == 0) {
+            snprintf(cfg->log_file, sizeof(cfg->log_file), "%s", val);
         } else {
             cs_log(LOG_DEBUG,
                    "config line %d: unknown key '%s' in [%s]",
@@ -204,6 +207,11 @@ cs_config_parse_args(server_config_t *cfg, int argc, char **argv)
             if (n <= 0)
                 cs_fatal("invalid max-conn: %s", argv[i]);
             cfg->max_connections = n;
+
+        } else if (strcmp(argv[i], "--log-file") == 0
+                   && i + 1 < argc) {
+            snprintf(cfg->log_file, sizeof(cfg->log_file),
+                     "%s", argv[++i]);
 
         } else if (strcmp(argv[i], "--config") == 0
                    && i + 1 < argc) {

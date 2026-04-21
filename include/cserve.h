@@ -54,6 +54,9 @@ typedef struct {
     slice_t   body;
     int       keep_alive;     /* 1 if Connection: keep-alive */
     uint64_t  content_length;
+    /* Conditional GET fields -- populated by parser if present */
+    slice_t   if_none_match;      /* value of If-None-Match header */
+    slice_t   if_modified_since;  /* value of If-Modified-Since header */
 } http_request_t;
 
 /* HTTP response built by a handler */
@@ -137,6 +140,7 @@ typedef struct {
     int      keepalive_timeout_ms;   /* default 30000 */
     size_t   max_body_bytes;         /* default 1 MB */
     int      log_level;
+    char     log_file[PATH_MAX];     /* "" = stdout */
     route_t  routes[MAX_ROUTES];
     int      route_count;
 } server_config_t;
@@ -147,6 +151,8 @@ typedef struct {
 
 /* log.c */
 void              cs_log_set_level(int level);
+void              cs_log_open(const char *path);
+void              cs_log_reopen(void);
 void              cs_log(int level, const char *fmt, ...);
 [[noreturn]] void cs_fatal(const char *fmt, ...);
 
@@ -196,5 +202,6 @@ uint64_t cs_now_ms(void);
 int      cs_url_decode(const char *in, size_t in_len,
                        char *out, size_t out_size);
 int      cs_path_safe(const char *docroot, const char *path);
+int      cs_http_date(time_t t, char *buf, size_t size);
 
 #endif /* CSERVE_H */

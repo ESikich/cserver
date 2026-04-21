@@ -1,5 +1,9 @@
 build*/
-fuzz/findings/
+fuzz/findings*/
+fuzz/cserve_fuzz*/
+.claude/
+bench.py
 *.o
 *.a
-*.claude
+*.html
+*:Zone.Identifier

@@ -14,6 +14,7 @@
 #include <sys/sendfile.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -31,6 +32,7 @@ static uint64_t         g_shutdown_ms   = 0;
 /* Sentinels stored by address so data.ptr can distinguish event types */
 static int g_listen_sentinel;
 static int g_signal_sentinel;
+static int g_timer_sentinel;
 
 /* ------------------------------------------------------------------ */
 /* Socket and signal setup                                             */
@@ -72,6 +74,7 @@ make_signalfd(void)
     sigemptyset(&mask);
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGHUP);
 
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
         cs_fatal("sigprocmask: %s", strerror(errno));
@@ -81,6 +84,24 @@ make_signalfd(void)
         cs_fatal("signalfd: %s", strerror(errno));
 
     return sfd;
+}
+
+static int
+make_timerfd(void)
+{
+    int tfd = timerfd_create(CLOCK_MONOTONIC,
+                             TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0)
+        cs_fatal("timerfd_create: %s", strerror(errno));
+
+    struct itimerspec spec = {
+        .it_interval = { .tv_sec = 1, .tv_nsec = 0 },
+        .it_value    = { .tv_sec = 1, .tv_nsec = 0 },
+    };
+    if (timerfd_settime(tfd, 0, &spec, NULL) < 0)
+        cs_fatal("timerfd_settime: %s", strerror(errno));
+
+    return tfd;
 }
 
 /* ------------------------------------------------------------------ */
@@ -366,6 +387,21 @@ conn_dispatch(int epfd, conn_t *conn)
                   conn->parser.req.keep_alive ? "keep-alive"
                                               : "close");
 
+    /* HEAD: send headers only, suppress body */
+    {
+        slice_t m = conn->parser.req.method;
+        if (m.len == 4 &&
+            memcmp(conn->inbuf + m.off, "HEAD", 4) == 0) {
+            if (conn->response.file_fd >= 0) {
+                close(conn->response.file_fd);
+                conn->response.file_fd = -1;
+            }
+            conn->response.file_size = 0;
+            conn->response.body      = NULL;
+            conn->response.body_len  = 0;
+        }
+    }
+
     conn->state = CONN_WRITING_RESPONSE;
     resp_write_status_and_headers(conn);
     conn_write_response(epfd, conn);
@@ -492,6 +528,11 @@ handle_conn_event(int epfd, conn_t *conn, uint32_t events)
         conn_send_error(epfd, conn, 431);
         return;
     }
+    if (rc == -501) {
+        conn->parser.req.keep_alive = 0;
+        conn_send_error(epfd, conn, 501);
+        return;
+    }
     if (rc < 0) {
         conn_send_error(epfd, conn, 400);
         return;
@@ -566,38 +607,48 @@ close_idle_conn(conn_t *conn, void *arg)
 /* ------------------------------------------------------------------ */
 
 static void
-server_loop(int epfd, int sfd)
+server_loop(int epfd, int sfd, int tfd)
 {
     struct epoll_event events[MAX_EVENTS];
 
     for (;;) {
-        int n = epoll_wait(epfd, events, MAX_EVENTS, 1000);
+        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
             cs_fatal("epoll_wait: %s", strerror(errno));
         }
-        if (n == 0) {
-            check_timeouts(epfd);
-            if (g_shutting_down) {
-                uint64_t elapsed = cs_now_ms() - g_shutdown_ms;
-                if (cs_conn_active_count() == 0
-                    || elapsed >= SHUTDOWN_GRACE_MS)
-                    return;
-            }
-            continue;
-        }
 
         for (int i = 0; i < n; i++) {
             void *ptr = events[i].data.ptr;
 
+            if (ptr == &g_timer_sentinel) {
+                uint64_t count;
+                if (read(tfd, &count, sizeof(count)) < 0) {}
+                check_timeouts(epfd);
+                if (g_shutting_down) {
+                    uint64_t elapsed = cs_now_ms() - g_shutdown_ms;
+                    if (cs_conn_active_count() == 0
+                        || elapsed >= SHUTDOWN_GRACE_MS)
+                        return;
+                }
+                continue;
+            }
+
             if (ptr == &g_signal_sentinel) {
                 struct signalfd_siginfo si;
                 ssize_t rd = read(sfd, &si, sizeof(si));
-                if (rd == (ssize_t)sizeof(si))
-                    cs_log(LOG_INFO,
-                           "signal %u received, shutting down",
-                           si.ssi_signo);
+                if (rd != (ssize_t)sizeof(si))
+                    continue;
+
+                if (si.ssi_signo == SIGHUP) {
+                    cs_log_reopen();
+                    continue;
+                }
+
+                cs_log(LOG_INFO,
+                       "signal %u received, shutting down",
+                       si.ssi_signo);
 
                 g_shutting_down = 1;
                 g_shutdown_ms   = cs_now_ms();
@@ -615,6 +666,7 @@ server_loop(int epfd, int sfd)
                     return;
                 continue;
             }
+
             if (ptr == &g_listen_sentinel) {
                 if (!g_shutting_down)
                     handle_accept(epfd);
@@ -637,6 +689,7 @@ cs_server_run(server_config_t *cfg)
     signal(SIGPIPE, SIG_IGN);
 
     cs_log_set_level(cfg->log_level);
+    cs_log_open(cfg->log_file);
     cs_conn_pool_init(cfg->max_connections);
 
     if (cfg->docroot[0] != '\0')
@@ -663,13 +716,22 @@ cs_server_run(server_config_t *cfg)
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &sev) < 0)
         cs_fatal("epoll_ctl add signalfd: %s", strerror(errno));
 
+    int tfd = make_timerfd();
+    struct epoll_event tev = {
+        .events   = EPOLLIN,
+        .data.ptr = &g_timer_sentinel,
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &tev) < 0)
+        cs_fatal("epoll_ctl add timerfd: %s", strerror(errno));
+
     cs_log(LOG_INFO, "listening on %s:%u (docroot: %s)",
            cfg->host, cfg->port,
            cfg->docroot[0] ? cfg->docroot : "(none)");
 
-    server_loop(epfd, sfd);
+    server_loop(epfd, sfd, tfd);
 
     cs_log(LOG_INFO, "shutdown complete");
+    close(tfd);
     close(sfd);
     if (g_listen_fd >= 0)
         close(g_listen_fd);

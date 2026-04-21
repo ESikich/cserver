@@ -7,9 +7,23 @@ Serves static files and exposes a handler API for dynamic content.
 
 ```
 $ ab -n 10000 -c 100 -k http://127.0.0.1:18080/
-Requests per second: 42663 [#/sec]
+Requests per second: 48142 [#/sec]
 Failed requests:     0
 ```
+
+---
+
+## Features
+
+- HTTP/1.1 keep-alive
+- ETag and Last-Modified headers — conditional GET (304 Not Modified)
+- HEAD method
+- Static file serving via `sendfile()`
+- Dynamic handler API
+- Structured access log with file output and SIGHUP rotation
+- Graceful shutdown on SIGTERM/SIGINT
+- systemd unit file included
+- Parser and URL decoder fuzz-tested with AFL++
 
 ---
 
@@ -43,12 +57,13 @@ step, no shared libraries.
 All options:
 
 ```
---host     <addr>   Interface to bind       (default: 0.0.0.0)
---port     <port>   Port to listen on       (default: 8080)
---root     <path>   Document root           (default: ./www)
---config   <path>   Path to INI file
---log      <level>  off|error|info|debug    (default: info)
---max-conn <n>      Max concurrent connections (default: 4096)
+--host       <addr>   Interface to bind          (default: 0.0.0.0)
+--port       <port>   Port to listen on          (default: 8080)
+--root       <path>   Document root              (default: ./www)
+--config     <path>   Path to INI file
+--log        <level>  off|error|info|debug       (default: info)
+--log-file   <path>   Log file path              (default: stdout)
+--max-conn   <n>      Max concurrent connections (default: 4096)
 ```
 
 ---
@@ -62,8 +77,9 @@ takes priority over compiled-in defaults.
 [server]
 host     = 0.0.0.0
 port     = 8080
-root     = ./www
+root     = /var/www
 log      = info
+log_file = /var/log/cserve/access.log
 max_conn = 4096
 
 [limits]
@@ -73,6 +89,56 @@ max_body_bytes       = 1048576
 ```
 
 Pass the file path with `--config cserve.ini`.
+
+---
+
+## Running as a service
+
+A systemd unit file is included at `cserve.service`. Copy it into place
+and enable it:
+
+```sh
+sudo cp cserve.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cserve
+```
+
+Log rotation with logrotate:
+
+```
+/var/log/cserve/access.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    postrotate
+        systemctl kill -s HUP cserve
+    endscript
+}
+```
+
+---
+
+## Caching
+
+The static file handler sets `ETag` and `Last-Modified` on every 200
+response. Subsequent requests with `If-None-Match` or
+`If-Modified-Since` receive a 304 with no body if the file has not
+changed. Browsers and well-behaved HTTP clients handle this
+automatically.
+
+```sh
+# First request
+curl -I http://127.0.0.1:8080/
+# HTTP/1.1 200 OK
+# ETag: "69e7a5cf0002c717"
+# Last-Modified: Tue, 21 Apr 2026 16:29:03 GMT
+
+# Subsequent request
+curl -I -H 'If-None-Match: "69e7a5cf0002c717"' http://127.0.0.1:8080/
+# HTTP/1.1 304 Not Modified
+```
 
 ---
 
@@ -121,19 +187,29 @@ cmake --build build -- tests
 ctest --test-dir build --output-on-failure
 ```
 
-Tests cover the HTTP parser, router, and utility functions. They run
-without network access or file I/O.
+Tests cover the HTTP parser, router, utility functions, and conditional
+GET logic. They run without network access.
 
 ---
 
 ## Fuzzing
 
-The `fuzz/` directory contains an AFL++ harness for the HTTP parser.
+The `fuzz/` directory contains AFL++ harnesses for the HTTP parser and
+URL decoder.
 
 ```sh
-AFL_SKIP_CPUFREQ=1 afl-fuzz -i fuzz/corpus -o fuzz/findings \
-    -- ./build/cserve_fuzz
+# Build harnesses (afl-cc required)
+AFL_SKIP_CPUFREQ=1 afl-cc -std=c2x -D_GNU_SOURCE -I include \
+    fuzz/fuzz_parser.c src/parser.c src/util.c \
+    -o fuzz/cserve_fuzz
+
+# Run
+AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
+    afl-fuzz -i fuzz/corpus -o fuzz/findings \
+    -- fuzz/cserve_fuzz
 ```
+
+Check `fuzz/findings/crashes/` when done — empty is the result you want.
 
 ---
 
@@ -142,7 +218,8 @@ AFL_SKIP_CPUFREQ=1 afl-fuzz -i fuzz/corpus -o fuzz/findings \
 The server is documented in `cserve-design.txt`. Short version:
 
 - **Concurrency:** single-threaded epoll event loop, edge-triggered
-  (`EPOLLET`). All sockets `O_NONBLOCK` via `accept4`.
+  (`EPOLLET`). timerfd for the timeout wheel. signalfd for
+  SIGTERM/SIGHUP/SIGINT. All sockets `O_NONBLOCK` via `accept4`.
 - **Memory:** fixed-size connection pool (default 4096). Per-request
   arena allocator reset between keep-alive cycles. No `malloc()` in
   the hot path.
@@ -151,6 +228,8 @@ The server is documented in `cserve-design.txt`. Short version:
   headers, and body enforced at parse time.
 - **File serving:** `sendfile()` for zero-copy file-to-socket transfer.
   `realpath()` + prefix check on every path to prevent traversal.
+- **Caching:** ETag computed from mtime and file size. Conditional GET
+  checked before opening the file.
 
 ---
 
@@ -159,28 +238,29 @@ The server is documented in `cserve-design.txt`. Short version:
 ```
 src/
   main.c       entry point, argv parsing
-  server.c     epoll loop, accept, event dispatch
+  server.c     epoll loop, timerfd, signalfd, accept, shutdown
   conn.c       connection pool, arena allocator
   parser.c     HTTP/1.1 request parser
   router.c     route table, dispatch
-  static.c     static file handler, MIME types
-  response.c   response builder helpers
+  static.c     static file handler, MIME types, ETag, conditional GET
+  response.c   response builder, HEAD suppression
+  log.c        logger, log file, SIGHUP reopen
   config.c     INI parser, config defaults
-  log.c        logger
-  util.c       URL decode, path utilities
+  util.c       URL decode, path utilities, HTTP-date formatting
 
 include/
   cserve.h     all public types and declarations
 
 tests/         unit tests (no framework, plain C)
-fuzz/          AFL++ harness
+fuzz/          AFL++ harnesses
+cserve.service systemd unit file
 ```
 
 ---
 
 ## Requirements
 
-- Linux (epoll, sendfile, signalfd)
+- Linux (epoll, sendfile, signalfd, timerfd)
 - GCC >= 13 or Clang >= 17
 - CMake >= 3.20
 - No runtime dependencies beyond libc

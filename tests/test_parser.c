@@ -123,6 +123,57 @@ test_connection_close(void)
 }
 
 static int
+test_transfer_encoding_chunked(void)
+{
+    parser_t p;
+    cs_parser_init(&p);
+
+    const char *raw =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n";
+    int rc = cs_parser_feed(&p, (const uint8_t *)raw, strlen(raw));
+    CHECK(rc == -501, "TE-chunked: returns -501");
+    return 0;
+}
+
+static int
+test_duplicate_content_length_same(void)
+{
+    parser_t p;
+    cs_parser_init(&p);
+
+    const char *raw =
+        "POST /echo HTTP/1.1\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello";
+    int rc = cs_parser_feed(&p, (const uint8_t *)raw, strlen(raw));
+    CHECK(rc == 1, "dup-cl-same: identical values accepted");
+    CHECK(p.req.content_length == 5, "dup-cl-same: correct length");
+    return 0;
+}
+
+static int
+test_duplicate_content_length_differ(void)
+{
+    parser_t p;
+    cs_parser_init(&p);
+
+    const char *raw =
+        "POST /echo HTTP/1.1\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 10\r\n"
+        "\r\n"
+        "hello";
+    int rc = cs_parser_feed(&p, (const uint8_t *)raw, strlen(raw));
+    CHECK(rc == -1, "dup-cl-differ: differing values rejected");
+    return 0;
+}
+
+static int
 test_max_headers(void)
 {
     parser_t p;
@@ -175,6 +226,21 @@ main(void)
 
     f_before = failures; test_connection_close();
     printf("%s: test_connection_close\n",
+           failures == f_before ? "PASS" : "FAIL");
+    t++;
+
+    f_before = failures; test_transfer_encoding_chunked();
+    printf("%s: test_transfer_encoding_chunked\n",
+           failures == f_before ? "PASS" : "FAIL");
+    t++;
+
+    f_before = failures; test_duplicate_content_length_same();
+    printf("%s: test_duplicate_content_length_same\n",
+           failures == f_before ? "PASS" : "FAIL");
+    t++;
+
+    f_before = failures; test_duplicate_content_length_differ();
+    printf("%s: test_duplicate_content_length_differ\n",
            failures == f_before ? "PASS" : "FAIL");
     t++;
 

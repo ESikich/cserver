@@ -83,9 +83,20 @@ add_executable(test_util
 )
 target_include_directories(test_util PRIVATE include)
 
+add_executable(test_cache
+    tests/test_cache.c
+    src/static.c
+    src/response.c
+    src/conn.c
+    src/util.c
+    src/log.c
+)
+target_include_directories(test_cache PRIVATE include)
+
 add_test(NAME parser COMMAND test_parser)
 add_test(NAME router COMMAND test_router)
 add_test(NAME util   COMMAND test_util)
+add_test(NAME cache  COMMAND test_cache)
 
 # ------------------------------------------------------------------ #
 # Fuzz target (opt-in: cmake -DFUZZ=1)                               #
@@ -100,6 +111,17 @@ if(FUZZ)
     )
     target_include_directories(fuzz_parser PRIVATE include)
     target_compile_options(fuzz_parser PRIVATE
+        -Wno-extra-semi
+        -Wno-gnu-statement-expression-from-macro-expansion
+    )
+
+    add_executable(fuzz_url
+        fuzz/fuzz_url.c
+        src/util.c
+        src/log.c
+    )
+    target_include_directories(fuzz_url PRIVATE include)
+    target_compile_options(fuzz_url PRIVATE
         -Wno-extra-semi
         -Wno-gnu-statement-expression-from-macro-expansion
     )

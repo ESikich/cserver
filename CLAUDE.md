@@ -136,27 +136,59 @@ Prefer designated initializers (C99 and valid in C23):
   };
 
 
+## Logging
+
+The logger (log.c) owns the log fd. All other modules call cs_log()
+or the level macros (log_error, log_info, log_debug). No module other
+than log.c and main.c may write directly to stderr or stdout.
+
+Log file reopen (SIGHUP) is handled entirely within log.c via
+cs_log_reopen(). The event loop calls this when it reads SIGHUP from
+the signalfd -- no other module is involved.
+
+Do not buffer log output. Each line must reach the fd before the
+function returns.
+
+
+## Signals
+
+All signal handling goes through the signalfd added to the epoll set.
+Do not use signal handlers, sigaction callbacks, or SA_RESTART anywhere
+in the codebase. The only exception is signal(SIGPIPE, SIG_IGN) in
+main(), which requires no handler.
+
+Graceful shutdown is triggered by the event loop reading SIGTERM or
+SIGINT from the signalfd. The shutdown sequence is defined in section 4
+of the design doc. Do not call exit() from the signal path -- set the
+global shutdown flag and let the event loop drain normally.
+
+
 ## Phasing
 
-Implement one phase at a time. Do not write phase 3 code while in
-phase 2. Stubs are acceptable -- mark them:
+Implement one phase at a time. Do not write phase 6 code while in
+phase 5. Stubs are acceptable -- mark them:
 
-  /* TODO: implement keep-alive (phase 3) */
+  /* TODO: implement conditional GET (phase 5) */
 
-A phase is complete when its code compiles clean at -Wall -Wextra
--Wpedantic -Werror, all tests in tests/ pass, and no TODO comments
-remain for that phase.
+A phase is complete when:
+  - Code compiles clean at -Wall -Wextra -Wpedantic -Werror
+  - All tests in tests/ pass under both Debug and Release builds
+  - No TODO comments remain for that phase
+  - The design doc section for that phase has been reviewed and
+    updated if anything changed during implementation
 
 
 ## Tests
 
-Every function in parser.c, router.c, and util.c must have at least
-one test in the corresponding test file. Tests are plain C -- no
-framework. Each test is a function returning int (0 pass, 1 fail).
+Every function in parser.c, router.c, util.c, and static.c must have
+at least one test in the corresponding test file. Tests are plain C --
+no framework. Each test is a function returning int (0 pass, 1 fail).
 A test runner in each file calls them in sequence and reports results
 to stdout.
 
-Tests must not depend on file I/O, sockets, or wall-clock time.
+Tests must not depend on network sockets or wall-clock time. File I/O
+is permitted in test_cache.c only, using temp files created and
+removed within the test.
 
 
 ## What Not To Do
@@ -168,3 +200,5 @@ Tests must not depend on file I/O, sockets, or wall-clock time.
 - Do not reformat code outside the files you are editing in a session.
 - Do not silently change struct fields or function signatures. If the
   design doc must change, say so explicitly before writing the code.
+- Do not write to stdout or stderr directly -- use the logger.
+- Do not handle signals outside of the signalfd path.

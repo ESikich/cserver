@@ -1,5 +1,0 @@
-POST /echo HTTP/1.1
-Host: localho|t
-Content-Length: R
-
-h

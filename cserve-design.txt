@@ -1,6 +1,6 @@
 cserve — Design Document
 HTTP/1.1 Server in C (Linux)
-Rev 4 — DRAFT
+Rev 5 — DRAFT
 ========================================================================
 
 
@@ -8,16 +8,17 @@ Rev 4 — DRAFT
 ------------------------------------------------------------------------
 
 cserve is a single-process, event-driven HTTP/1.1 server targeting
-Linux. It aims to serve static files and support a minimal plugin-style
-handler API for dynamic content -- a teaching tool, an embedded server
-for a CLI tool, or a foundation for experimentation. It is not trying
-to be nginx.
+Linux. It serves static files and dynamic content via a handler API.
+It is not trying to be nginx.
 
 Goals:
   - Correctness over performance
+  - Complete HTTP/1.1 including caching headers and conditional GET
   - Handle HTTP/1.1 keep-alive
   - Serve static files efficiently via sendfile()
   - Expose a clean handler registration API
+  - Structured access log with rotation
+  - Graceful shutdown
   - No external dependencies -- only libc and POSIX sockets
 
 Non-Goals:
@@ -25,7 +26,7 @@ Non-Goals:
   - HTTP/2
   - Windows or macOS portability
   - A scripting layer
-  - Production hardening against all possible malice
+  - Rate limiting (handle at the network/proxy layer)
 
 
 2. ARCHITECTURE
@@ -34,10 +35,11 @@ Non-Goals:
 Layers, top to bottom:
 
   TRANSPORT        socket, bind, listen, accept4
-  EVENT LOOP       epoll (edge-triggered, EPOLLET)
+  EVENT LOOP       epoll (edge-triggered, EPOLLET) + timerfd + signalfd
   CONNECTION MGR   conn_table, state machine, timeout wheel
   HTTP PARSER      request line, header parser, body framing
   ROUTER           static handler, dynamic handlers, 404/405
+  CACHE LAYER      ETag, Last-Modified, conditional GET (304)
   RESPONSE WRITER  header builder, sendfile, writev scatter
   UTILITIES        arena allocator, string pool, logger, config
 
@@ -59,6 +61,12 @@ EAGAIN -- rather than relying on epoll to re-notify. Edge-triggered
 is chosen because it scales better and makes partial-read bugs
 immediately obvious rather than silently masking them.
 
+The epoll set contains:
+  - The listen socket (EPOLLIN)
+  - All active connection fds (EPOLLIN | EPOLLOUT | EPOLLET)
+  - A timerfd for the timeout wheel (EPOLLIN)
+  - A signalfd for SIGTERM/SIGHUP (EPOLLIN)
+
 Why epoll and not io_uring:
 
   io_uring is the modern Linux answer for high-performance async I/O.
@@ -67,17 +75,20 @@ Why epoll and not io_uring:
   architecture and a reasonably recent kernel (5.1+).
 
   epoll is universal, well-understood, and sufficient for our goals.
-  io_uring is noted as a v2 upgrade path.
+  io_uring is noted as a v3 upgrade path.
 
 Dynamic handler callbacks must be non-blocking. Any handler that needs
 slow work (DB, subprocess) is expected to schedule that work itself and
-return immediately. No async runtime is provided in v1.
+return immediately. No async runtime is provided in v1/v2.
 
 Linux-specific setup:
 
   SIGPIPE must be ignored (signal(SIGPIPE, SIG_IGN)) before any socket
-  operations. SIGTERM and SIGINT are caught for graceful shutdown via
-  a self-pipe or signalfd -- not from within a signal handler directly.
+  operations. SIGTERM, SIGINT, and SIGHUP are handled via signalfd
+  added to the epoll set -- not from within a signal handler directly.
+
+  SIGTERM / SIGINT  graceful shutdown (finish in-flight requests)
+  SIGHUP            reopen the log file (rotation trigger)
 
 
 4. CONNECTION LIFECYCLE
@@ -96,7 +107,8 @@ Each connection is a state machine with the following states:
     Look up the route table. Call the matched handler synchronously.
     Handler writes response headers and body into the conn's output
     buffer. For file responses, it stores the fd + offset instead of
-    copying bytes.
+    copying bytes. Conditional GET check happens here before the
+    handler is called for static files.
     -> WRITING_RESPONSE
 
   WRITING_RESPONSE
@@ -108,9 +120,18 @@ Each connection is a state machine with the following states:
 
   CLOSING
     shutdown(SHUT_RDWR), close(fd), remove from epoll, return conn
-    struct to pool. A coarse-grained timeout wheel evicts idle
+    struct to pool. A timerfd-driven timeout wheel evicts idle
     keep-alive connections after a configurable deadline (default 30s).
     -> CLOSED (pooled)
+
+Graceful shutdown sequence (on SIGTERM/SIGINT):
+
+  1. Stop accepting new connections (remove listen fd from epoll).
+  2. Set a global shutdown flag.
+  3. Allow in-flight requests to complete normally.
+  4. Close all idle keep-alive connections immediately.
+  5. Once all connections reach CLOSED, flush the log and exit(0).
+  6. If connections have not drained within 5 seconds, exit(0) anyway.
 
 
 5. HTTP PARSER
@@ -191,11 +212,14 @@ not add, remove, or rename fields without updating this document.
       slice_t   body;
       int       keep_alive;   /* 1 if Connection: keep-alive */
       uint64_t  content_length;
+      /* Conditional GET fields -- populated by parser if present */
+      slice_t   if_none_match;       /* value of If-None-Match header */
+      slice_t   if_modified_since;   /* value of If-Modified-Since header */
   } http_request_t;
 
   /* HTTP response built by a handler */
   typedef struct {
-      int      status;                /* e.g. 200, 404 */
+      int      status;                /* e.g. 200, 304, 404 */
       char     headers[4096];         /* pre-formatted header block */
       size_t   headers_len;
       /* For in-memory body (dynamic handlers): */
@@ -274,6 +298,7 @@ not add, remove, or rename fields without updating this document.
       int      keepalive_timeout_ms;  /* default 30000 */
       size_t   max_body_bytes;     /* default 1 MB */
       int      log_level;          /* 0=off 1=error 2=info 3=debug */
+      char     log_file[PATH_MAX]; /* "" = stdout */
       route_t  routes[MAX_ROUTES];
       int      route_count;
   } server_config_t;
@@ -333,7 +358,69 @@ The static file handler is registered automatically for any path not
 matched by a dynamic route, provided docroot is configured.
 
 
-9. ERROR HANDLING CONVENTIONS
+9. CACHING & CONDITIONAL GET
+------------------------------------------------------------------------
+
+The static file handler sets the following response headers on every
+200 response:
+
+  Last-Modified   mtime of the file formatted as HTTP-date
+  ETag            quoted hex string of (mtime << 32 | size); e.g.
+                  ETag: "17f3a2c400000001b"
+
+On subsequent requests the parser populates req->if_none_match and
+req->if_modified_since if present. The static handler checks these
+before opening the file:
+
+  If-None-Match:    compare against ETag; if match, return 304
+  If-Modified-Since: compare against mtime; if not newer, return 304
+
+A 304 response has status 304, no body, and repeats the caching
+headers. resp->file_fd remains -1. resp->body remains NULL.
+
+Dynamic handlers are responsible for their own caching headers.
+cs_add_header() is available for this purpose. The framework does not
+automatically apply conditional GET logic to dynamic responses.
+
+HEAD requests are handled by the framework: the matched handler runs
+normally, the response headers are sent, and the body (if any) is
+suppressed before writing to the socket. Handlers do not need to
+special-case HEAD.
+
+
+10. LOGGING
+------------------------------------------------------------------------
+
+The logger writes to a file (configurable) or stdout (default).
+All writes go through a single write() call per log line to avoid
+interleaving (safe because the server is single-threaded).
+
+Log file path is set via --log-file <path> or the INI [server] log_file
+key. Empty string means stdout.
+
+SIGHUP triggers log file rotation:
+  1. Close the current log fd.
+  2. Re-open log_file with O_WRONLY | O_CREAT | O_APPEND.
+  3. Log one line: "log reopened".
+
+This is the standard Unix logrotate integration pattern. The logrotate
+config should use copytruncate or send SIGHUP after rotating.
+
+Access log format (LOG_INFO, one line per completed request):
+  [INFO] timestamp_ms method path status bytes_sent remote_addr
+
+Error log format (LOG_ERROR):
+  [ERROR] timestamp_ms message
+
+Debug log format (LOG_DEBUG):
+  [DEBUG] timestamp_ms message
+
+timestamp_ms is milliseconds since Unix epoch (clock_gettime
+CLOCK_REALTIME). All lines are terminated with '\n'. No buffering --
+each line is written immediately.
+
+
+11. ERROR HANDLING CONVENTIONS
 ------------------------------------------------------------------------
 
 All errors fall into one of three categories:
@@ -351,76 +438,84 @@ All errors fall into one of three categories:
     LOG_ERROR level. The server continues running.
 
   SOFT ERROR
-    Expected conditions: 404, 405, 413, 431, 503. The server sends the
-    appropriate HTTP response with a plain-text body, sets
-    Connection: close where appropriate, and recycles the connection
-    normally.
+    Expected conditions: 304, 404, 405, 413, 431, 503. The server
+    sends the appropriate HTTP response, sets Connection: close where
+    appropriate, and recycles the connection normally.
 
 Logging levels:
   LOG_ERROR (1)  -- connection drops, parse failures, handler errors
   LOG_INFO  (2)  -- one line per completed request (access log style)
   LOG_DEBUG (3)  -- state transitions, buffer drain progress
 
-Log format (one line per entry, to stdout):
-  [LEVEL] timestamp_ms method path status bytes_sent remote_addr
 
-
-10. FILE LAYOUT
+12. FILE LAYOUT
 ------------------------------------------------------------------------
 
 All source lives in a flat src/ directory. No subdirectories.
 
   src/
     main.c        Entry point. Parses argv, builds config, starts server.
-    server.c      epoll setup, listen socket, event loop, accept4.
+    server.c      epoll loop, timerfd, signalfd, accept4, shutdown.
     conn.c        Connection pool, conn_t lifecycle, arena allocator.
     parser.c      HTTP request parser state machine.
     router.c      Route table, dispatch, cs_add_route().
-    static.c      Static file handler, MIME types, sendfile().
-    response.c    Response builder helpers: cs_add_header(), status lines.
-    log.c         Logger. Thread-unsafe (single-threaded server, fine).
+    static.c      Static file handler, MIME types, sendfile(),
+                  ETag/Last-Modified generation, conditional GET.
+    response.c    Response builder helpers: cs_add_header(), status lines,
+                  HEAD suppression.
+    log.c         Logger, log file open/reopen, SIGHUP handling.
     config.c      Config defaults, INI file parsing, argv parsing.
-    util.c        URL decode, path safety check, string utilities.
+    util.c        URL decode, path safety check, string utilities,
+                  HTTP-date formatting.
 
   include/
     cserve.h      All public types and function declarations.
                   Single header -- everything is declared here.
 
   tests/
-    test_parser.c Unit tests for the HTTP parser.
-    test_router.c Unit tests for route matching.
-    test_util.c   Unit tests for URL decode and path checks.
+    test_parser.c   Unit tests for the HTTP parser.
+    test_router.c   Unit tests for route matching.
+    test_util.c     Unit tests for URL decode, path checks, HTTP-date.
+    test_cache.c    Unit tests for ETag generation and conditional GET.
 
-  CMakeLists.txt  (see section 12)
+  fuzz/
+    fuzz_parser.c   AFL++ harness for the HTTP parser.
+    fuzz_url.c      AFL++ harness for the URL decoder.
+
+  CMakeLists.txt  (see section 14)
+  cserve.ini      Example configuration file
+  cserve.service  systemd unit file
 
 
-11. LINUX API REFERENCE
+13. LINUX API REFERENCE
 ------------------------------------------------------------------------
 
 Key system calls and their roles in cserve:
 
-  epoll_create1(EPOLL_CLOEXEC)   create epoll instance
-  epoll_ctl(EPOLL_CTL_ADD/MOD)   add/modify fd in interest list
-  epoll_wait()                   block until events ready
+  epoll_create1(EPOLL_CLOEXEC)        create epoll instance
+  epoll_ctl(EPOLL_CTL_ADD/MOD/DEL)    manage fd interest list
+  epoll_wait()                         block until events ready
+  timerfd_create / timerfd_settime     timeout wheel tick source
+  signalfd()                           receive SIGTERM/SIGHUP/SIGINT
   accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)  accept + set flags atomically
-  read() / write()               non-blocking I/O on conn fds
-  writev()                       scatter-gather write for response
-  sendfile()                     zero-copy file-to-socket transfer
-  open() / close()               static file access
-  realpath()                     canonical path for traversal check
-  signal(SIGPIPE, SIG_IGN)       suppress broken-pipe termination
-  signalfd()                     receive SIGTERM/SIGINT in event loop
-  clock_gettime(CLOCK_MONOTONIC) millisecond timestamps for timeouts
+  read() / write()                     non-blocking I/O on conn fds
+  writev()                             scatter-gather write for response
+  sendfile()                           zero-copy file-to-socket transfer
+  open() / close() / fstat()           static file access + metadata
+  realpath()                           canonical path for traversal check
+  signal(SIGPIPE, SIG_IGN)            suppress broken-pipe termination
+  clock_gettime(CLOCK_MONOTONIC)       timeout wheel timestamps
+  clock_gettime(CLOCK_REALTIME)        access log timestamps
 
 
-12. BUILD SYSTEM
+14. BUILD SYSTEM
 ------------------------------------------------------------------------
 
 Toolchain: GCC or Clang via CMake. GCC >= 13 or Clang >= 17
            required for C23 support.
 Standard: C23 (-std=c23).
 Target: x86-64 Linux only. _GNU_SOURCE defined project-wide
-        (required for accept4, signalfd, sendfile).
+        (required for accept4, signalfd, sendfile, timerfd).
 
 CMakeLists.txt requirements:
   - cmake_minimum_required(VERSION 3.20)
@@ -428,6 +523,8 @@ CMakeLists.txt requirements:
   - Two build configs: Debug (-O0 -g3 -fsanitize=address,undefined)
     and Release (-O2)
   - A "tests" target that builds and runs tests/ with CTest
+  - A "fuzz" target that builds fuzz/ harnesses (no sanitizers,
+    AFL_CC compiler wrapper expected)
 
 Compiler warnings: -Wall -Wextra -Wpedantic -Werror. The following
 warnings are explicitly suppressed project-wide:
@@ -437,7 +534,7 @@ The build must produce a single executable: cserve.
 No shared libraries, no install target.
 
 
-13. CONFIGURATION
+15. CONFIGURATION
 ------------------------------------------------------------------------
 
 Configuration is loaded in this priority order (highest wins):
@@ -447,12 +544,13 @@ Configuration is loaded in this priority order (highest wins):
 
 Command-line arguments:
 
-  --host     <addr>   Interface to bind (default: 0.0.0.0)
-  --port     <port>   Port to listen on (default: 8080)
-  --root     <path>   Document root for static files (default: ./www)
-  --config   <path>   Path to INI file
-  --log      <level>  Log level: off|error|info|debug (default: info)
-  --max-conn <n>      Max concurrent connections (default: 4096)
+  --host       <addr>   Interface to bind (default: 0.0.0.0)
+  --port       <port>   Port to listen on (default: 8080)
+  --root       <path>   Document root for static files (default: ./www)
+  --config     <path>   Path to INI file
+  --log        <level>  Log level: off|error|info|debug (default: info)
+  --log-file   <path>   Log file path (default: stdout)
+  --max-conn   <n>      Max concurrent connections (default: 4096)
 
 INI file format (key = value, # comments):
 
@@ -461,6 +559,7 @@ INI file format (key = value, # comments):
   port     = 8080
   root     = /var/www
   log      = info
+  log_file = /var/log/cserve/access.log
   max_conn = 4096
 
   [limits]
@@ -472,7 +571,7 @@ Unknown keys are ignored with a LOG_DEBUG warning. Malformed values
 cause a fatal error with a descriptive message.
 
 
-14. RISKS
+16. RISKS
 ------------------------------------------------------------------------
 
 HIGH -- Buffer overflow in parser
@@ -488,8 +587,9 @@ HIGH -- Path traversal
 
 MEDIUM -- Slow-read DoS (Slowloris)
   Clients that trickle headers hold connections open.
-  Mitigation: timeout wheel evicts connections that haven't completed
-  a request within a configurable window (default 10s).
+  Mitigation: timerfd-driven timeout wheel evicts connections that
+  haven't completed a request within the configured window (default
+  10s).
 
 MEDIUM -- Connection pool exhaustion
   4096 slow keep-alive connections could exhaust the pool.
@@ -507,27 +607,38 @@ LOW -- Integer overflow in Content-Length
   Mitigation: parse as uint64_t, reject values above body limit before
   any reading begins.
 
+LOW -- Log file permissions
+  If log_file is writable by other users, log injection is possible.
+  Mitigation: document that log_file should be in a directory owned
+  and writable only by the cserve process user.
 
-15. BUILD PLAN
+
+17. BUILD PLAN
 ------------------------------------------------------------------------
 
-Phase 1 -- Skeleton
-  TCP echo server, epoll event loop, conn pool,
-  O_NONBLOCK sockets via accept4, SIGPIPE/SIGTERM handling
+Phases 1-4 are complete (v1.0).
 
-Phase 2 -- HTTP
-  Request parser, 200/404 responses, static file serving,
-  sendfile(), MIME types
+Phase 5 -- HTTP completeness
+  HEAD method suppression in response writer
+  ETag + Last-Modified generation in static handler
+  If-None-Match + If-Modified-Since handling (304 responses)
+  HTTP-date formatting utility
+  Tests: test_cache.c
 
-Phase 3 -- Production
-  Keep-alive, timeout wheel, dynamic handler API,
-  path traversal guard, config file
+Phase 6 -- Operability
+  Log file output (open, append, reopen on SIGHUP)
+  --log-file CLI flag and INI key
+  Graceful shutdown on SIGTERM/SIGINT
+  timerfd replacing ad-hoc timeout mechanism
+  signalfd for SIGTERM, SIGINT, SIGHUP
+  systemd unit file (cserve.service)
 
-Phase 4 -- Hardening
-  AFL++ fuzzing, AddressSanitizer clean run,
-  load testing, access log, graceful shutdown
+Phase 7 -- Hardening
+  Second AFL++ fuzzing pass: fuzz_url.c harness
+  HTTP conformance review (request handling edge cases)
+  Valgrind memcheck clean run on test suite
 
 
 ========================================================================
-cserve-design.txt // rev 4
+cserve-design.txt // rev 5 // DRAFT
 ========================================================================

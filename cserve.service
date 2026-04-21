@@ -1,0 +1,23 @@
+[Unit]
+Description=cserve HTTP/1.1 server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+ExecStart=/usr/local/bin/cserve \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --root /var/www \
+    --log info \
+    --log-file /var/log/cserve/access.log
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Log directory must exist and be writable by www-data before starting.
+# mkdir -p /var/log/cserve && chown www-data:www-data /var/log/cserve
+
+[Install]
+WantedBy=multi-user.target
